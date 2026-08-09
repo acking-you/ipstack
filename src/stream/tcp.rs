@@ -477,6 +477,7 @@ impl IpStackTcpStream {
                 network_tuple,
                 write_notify,
                 read_notify,
+                shutdown.clone(),
                 data_tx,
                 exit_monitor,
             )
@@ -505,6 +506,7 @@ async fn tcp_main_logic_loop(
     network_tuple: NetworkTuple,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
@@ -669,6 +671,21 @@ async fn tcp_main_logic_loop(
         tcb.update_duplicate_ack_count(incoming_ack);
 
         tcb.update_inflight_packet_queue(incoming_ack);
+
+        // A shutdown parked by `poll_shutdown` because data was still in flight
+        // has no other way back: `Shutdown::ready` is only reached once the
+        // session is already closed, and closing needs the very FIN that the
+        // parked shutdown is waiting to send. Waking it here, the moment the
+        // last byte is acknowledged, is what closes that circle. Without it an
+        // active half-close never completes, and a peer that relies on the
+        // close to frame its response waits until the session times out.
+        if tcb.get_inflight_packets_total_len() == 0
+            && tcb.get_state() == TcpState::Established
+            && let Shutdown::Pending(waker) = &*shutdown.lock().unwrap()
+        {
+            log::trace!("{network_tuple}: inflight queue drained, waking a parked shutdown");
+            waker.wake_by_ref();
+        }
 
         for packet in tcb.collect_timed_out_inflight_packets() {
             let (seq, count) = (packet.seq, packet.retransmit_count);
