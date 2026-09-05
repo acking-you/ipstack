@@ -195,8 +195,16 @@ impl IpStackTcpStream {
         );
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
+            // A stale ACK (including a challenge ACK after an abort) belongs to
+            // a connection whose TCB is already gone. RFC 9293 section 3.5.2
+            // requires SEG.ACK as the reset sequence, not a fresh random ISS.
+            let (flags, seq) = if tcp.ack {
+                (RST, Some(SeqNum(tcp.acknowledgment_number)))
+            } else {
+                (ACK | RST, None)
+            };
             if !tcp.rst
-                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, ACK | RST, None, None)
+                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, flags, seq, None)
             {
                 log::warn!("Error sending RST/ACK packet: {err}");
             }
@@ -235,6 +243,27 @@ impl IpStackTcpStream {
 
         stream.spawn_tasks()?;
         Ok(stream)
+    }
+
+    /// Abort this connection and notify its peer with a TCP reset.
+    ///
+    /// Use this when a relay must be discarded without draining in-flight data,
+    /// for example when its routing policy changes. Merely dropping the stream
+    /// removes local state without notifying the peer. Drop the stream after
+    /// calling this method to release its task and session-table entry.
+    pub fn abort(&mut self) -> std::io::Result<()> {
+        let mut tcb = self.tcb.lock().unwrap();
+        if matches!(tcb.get_state(), TcpState::Closed | TcpState::TimeWait) {
+            return Ok(());
+        }
+        write_packet_to_device(&self.up_packet_sender, self.network_tuple(), &tcb, None, ACK | RST, None, None)?;
+        tcb.change_state(TcpState::Closed);
+        // Signal after releasing the TCB lock: the task needs it while exiting.
+        drop(tcb);
+        if let Some(notifier) = &self.exit_notifier {
+            let _ = notifier.try_send(());
+        }
+        Ok(())
     }
 
     fn reset_timeout(&mut self) {
@@ -1053,4 +1082,86 @@ pub(crate) fn create_raw_packet(
         transport: TransportHeader::Tcp(tcp_header),
         payload: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_notifies_an_idle_peer_and_releases_the_session() {
+        let src: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let (packets, mut responses) = tokio::sync::mpsc::unbounded_channel();
+        let (removed, removal) = tokio::sync::oneshot::channel();
+        let syn = TcpHeader {
+            syn: true,
+            ..TcpHeader::new(src.port(), dst.port(), 1234, 65535)
+        };
+        let mut stream = IpStackTcpStream::new(src, dst, syn, packets, 1500, Some(removed), Arc::new(TcpConfig::default())).unwrap();
+        let syn_ack = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TransportHeader::Tcp(syn_ack) = syn_ack.transport_header() else {
+            panic!("expected TCP")
+        };
+        let expected_sequence = syn_ack.sequence_number.wrapping_add(1);
+        // Complete the handshake and ensure the task processed it by reading
+        // one synthetic payload byte. Everything stays in memory channels.
+        let packet = create_raw_packet(src, dst, |_, _| 1460, ACK | PSH, 64, 1235, expected_sequence, 65535, vec![7], None).unwrap();
+        stream.stream_sender.send(packet).unwrap();
+        let mut payload = [0];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload, [7]);
+        while responses.try_recv().is_ok() {}
+
+        stream.abort().unwrap();
+        let reset = responses
+            .try_recv()
+            .expect("abort must notify the peer without waiting for another packet");
+        assert_eq!(reset.src_addr(), dst);
+        assert_eq!(reset.dst_addr(), src);
+        let TransportHeader::Tcp(reset) = reset.transport_header() else {
+            panic!("expected TCP")
+        };
+        assert!(reset.rst);
+        assert_eq!(reset.sequence_number, expected_sequence);
+        assert_eq!(reset.acknowledgment_number, 1236);
+        stream.abort().unwrap();
+        assert!(responses.try_recv().is_err(), "abort is idempotent");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), removal).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn stale_ack_after_a_policy_abort_gets_a_reset_with_the_peers_expected_sequence() {
+        let src = "192.0.2.1:5000".parse().unwrap();
+        let dst = "198.51.100.1:443".parse().unwrap();
+        for is_reset in [false, true] {
+            let (packets, mut responses) = tokio::sync::mpsc::unbounded_channel();
+            let stale = TcpHeader {
+                ack: true,
+                rst: is_reset,
+                acknowledgment_number: 0x9876_5432,
+                ..TcpHeader::new(5000, 443, 9999, 65535)
+            };
+            assert!(IpStackTcpStream::new(src, dst, stale, packets, 1500, None, Arc::new(TcpConfig::default())).is_err());
+            if is_reset {
+                assert!(responses.try_recv().is_err(), "never respond to RST with another RST");
+            } else {
+                let reset = responses.try_recv().unwrap();
+                let TransportHeader::Tcp(reset) = reset.transport_header() else {
+                    panic!("expected TCP")
+                };
+                assert!(reset.rst);
+                assert!(!reset.ack);
+                assert_eq!(reset.sequence_number, 0x9876_5432);
+            }
+        }
+    }
 }
