@@ -25,7 +25,7 @@ jobs:
     - name: Build
       run: cargo build --verbose --examples --tests --all-features
     - name: Test
-      run: cargo test --all-features --examples
+      run: cargo test --all-features
 
   semver:
     name: Check semver

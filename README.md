@@ -3,6 +3,12 @@ IpStack
 
 An asynchronous lightweight userspace implementation of TCP/IP stack for Tun device.
 
+Use `IpStackUdpStream::recv` and `send` when forwarding datagrams: `Some(0)` is
+an empty packet, while `None` means the stream closed. Replies larger than MTU
+are emitted as IPv4/IPv6 fragments of one UDP datagram with one checksum, never
+as several independent UDP messages. The legacy stream traits remain available;
+`AsyncWriteExt::write_all` does not send an empty buffer.
+
 [![Crates.io](https://img.shields.io/crates/v/ipstack.svg)](https://crates.io/crates/ipstack)
 [![ipstack](https://docs.rs/ipstack/badge.svg)](https://docs.rs/ipstack)
 [![Documentation](https://img.shields.io/badge/docs-release-brightgreen.svg?style=flat)](https://docs.rs/ipstack)

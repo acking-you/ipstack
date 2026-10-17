@@ -3,7 +3,9 @@ use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
@@ -80,13 +82,11 @@ impl IpStackUdpStream {
         self.stream_sender.clone()
     }
 
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
+    fn create_rev_packet(&self, ttl: u8, payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
                 let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets()).map_err(IpStackError::from)?;
-                let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
-                payload.truncate(line_buffer as usize);
                 ip_h.set_payload_len(payload.len() + UHS).map_err(IpStackError::from)?;
                 let udp_header = UdpHeader::with_ipv4_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
                     .map_err(IpStackError::from)?;
@@ -106,11 +106,8 @@ impl IpStackUdpStream {
                     source: dst.octets(),
                     destination: src.octets(),
                 };
-                let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
-
-                payload.truncate(line_buffer as usize);
-
-                ip_h.payload_length = (payload.len() + UHS) as u16;
+                ip_h.payload_length =
+                    u16::try_from(payload.len() + UHS).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
                 let udp_header = UdpHeader::with_ipv6_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
                     .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
@@ -153,9 +150,117 @@ impl IpStackUdpStream {
         self.dst_addr
     }
 
+    /// Receive one datagram, including an empty one. `None` means the stream
+    /// ended; `Some(0)` is a valid empty UDP payload, never a TCP-style EOF.
+    pub async fn recv(&mut self, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
+        std::future::poll_fn(|cx| {
+            let mut buf = tokio::io::ReadBuf::new(buffer);
+            self.poll_datagram(cx, &mut buf).map_ok(|item| item.map(|()| buf.filled().len()))
+        })
+        .await
+    }
+
+    /// Send exactly one UDP datagram. Oversized packets are IP fragments of
+    /// that same datagram, with one UDP header and checksum for the whole body.
+    pub fn send(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let packet = self.create_rev_packet(TTL, payload.to_vec())?;
+        let header_len = match &packet.ip {
+            IpHeader::Ipv4(h) => h.header_len(),
+            IpHeader::Ipv6(h) => h.header_len(),
+        };
+        if header_len + 8 + payload.len() <= usize::from(self.mtu) {
+            self.up_pkt_sender.send(packet).map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+        } else {
+            let extension_len = if matches!(packet.ip, IpHeader::Ipv6(_)) { 8 } else { 0 };
+            let chunk_size = usize::from(self.mtu).saturating_sub(header_len + extension_len) / 8 * 8;
+            if chunk_size == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "MTU cannot fit an IP fragment",
+                ));
+            }
+            let bytes = packet.to_bytes()?;
+            let datagram = &bytes[header_len..];
+            let id = NEXT_FRAGMENT_ID.fetch_add(1, Ordering::Relaxed);
+            for (index, chunk) in datagram.chunks(chunk_size).enumerate() {
+                let offset = (index * chunk_size / 8) as u16;
+                let more = (index + 1) * chunk_size < datagram.len();
+                let (ip, payload) = match &packet.ip {
+                    IpHeader::Ipv4(original) => {
+                        let mut ip = original.clone();
+                        ip.identification = id as u16;
+                        ip.dont_fragment = false;
+                        ip.more_fragments = more;
+                        ip.fragment_offset = etherparse::IpFragOffset::try_new(offset).map_err(std::io::Error::other)?;
+                        ip.set_payload_len(chunk.len()).map_err(std::io::Error::other)?;
+                        (IpHeader::Ipv4(ip), chunk.to_vec())
+                    }
+                    IpHeader::Ipv6(original) => {
+                        let mut ip = original.clone();
+                        ip.next_header = IpNumber::IPV6_FRAGMENTATION_HEADER;
+                        ip.payload_length = (8 + chunk.len()) as u16;
+                        let fragment = etherparse::Ipv6FragmentHeader::new(
+                            IpNumber::UDP,
+                            etherparse::IpFragOffset::try_new(offset).map_err(std::io::Error::other)?,
+                            more,
+                            id,
+                        );
+                        let mut payload = fragment.to_bytes().to_vec();
+                        payload.extend_from_slice(chunk);
+                        (IpHeader::Ipv6(ip), payload)
+                    }
+                };
+                self.up_pkt_sender
+                    .send(NetworkPacket {
+                        ip,
+                        transport: TransportHeader::Unknown,
+                        payload: Some(payload),
+                    })
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            }
+        }
+        self.reset_timeout();
+        Ok(())
+    }
+
     fn reset_timeout(&mut self) {
         let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
+    }
+}
+
+impl IpStackUdpStream {
+    fn poll_datagram(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<Option<()>>> {
+        if let Some(p) = self.first_payload.take() {
+            // Clamp to `buf.remaining()`: an oversized datagram would otherwise
+            // panic `put_slice` (hit under `copy_bidirectional` write
+            // backpressure). Unlike the TCP path the remainder is DROPPED, not buffered matches `recvfrom` without MSG_WAITALL.
+            let n = p.len().min(buf.remaining());
+            buf.put_slice(&p[..n]);
+            self.reset_timeout();
+            return std::task::Poll::Ready(Ok(Some(())));
+        }
+        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
+            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        }
+
+        match self.stream_receiver.poll_recv(cx) {
+            std::task::Poll::Ready(Some(p)) => {
+                self.reset_timeout();
+                if let Some(payload) = p.payload {
+                    // Clamp like the first_payload branch above (drop the tail).
+                    let n = payload.len().min(buf.remaining());
+                    buf.put_slice(&payload[..n]);
+                }
+                std::task::Poll::Ready(Ok(Some(())))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(None)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -165,42 +270,14 @@ impl AsyncRead for IpStackUdpStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(p) = self.first_payload.take() {
-            // Clamp to `buf.remaining()`: an oversized datagram would otherwise
-            // panic `put_slice` (hit under `copy_bidirectional` write
-            // backpressure). Unlike the TCP path the remainder is DROPPED, not buffered matches `recvfrom` without MSG_WAITALL.
-            let n = p.len().min(buf.remaining());
-            buf.put_slice(&p[..n]);
-            return std::task::Poll::Ready(Ok(()));
-        }
-        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-        }
-
-        self.reset_timeout();
-
-        match self.stream_receiver.poll_recv(cx) {
-            std::task::Poll::Ready(Some(p)) => {
-                if let Some(payload) = p.payload {
-                    // Clamp like the first_payload branch above (drop the tail).
-                    let n = payload.len().min(buf.remaining());
-                    buf.put_slice(&payload[..n]);
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        self.poll_datagram(cx, buf).map_ok(|_| ())
     }
 }
 
 impl AsyncWrite for IpStackUdpStream {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        self.reset_timeout();
-        let packet = self.create_rev_packet(TTL, buf.to_vec())?;
-        let payload_len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-        self.up_pkt_sender.send(packet).or(Err(std::io::ErrorKind::UnexpectedEof))?;
-        std::task::Poll::Ready(Ok(payload_len))
+        self.send(buf)?;
+        std::task::Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
@@ -224,6 +301,52 @@ impl Drop for IpStackUdpStream {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn udp_write_preserves_a_datagram_larger_than_mtu() {
+        use tokio::io::AsyncWriteExt;
+        for (src, dst, header_size) in [("127.0.0.1:1234", "127.0.0.1:53", 20), ("[::1]:1234", "[::1]:53", 40)] {
+            let (sender, mut packets) = mpsc::unbounded_channel();
+            let mut stream = IpStackUdpStream::new(
+                src.parse().unwrap(),
+                dst.parse().unwrap(),
+                vec![],
+                sender,
+                1500,
+                Duration::from_secs(30),
+                None,
+            );
+            let payload = (0..4000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            stream.write_all(&payload).await.unwrap();
+            let mut datagram = Vec::new();
+            while let Ok(packet) = packets.try_recv() {
+                let wire = packet.to_bytes().unwrap();
+                assert!(wire.len() <= 1500);
+                let offset = if header_size == 20 {
+                    let offset = u16::from_be_bytes([wire[6], wire[7]]) & 0x1fff;
+                    assert_eq!(usize::from(offset) * 8, datagram.len(), "fragments must share one UDP datagram");
+                    header_size
+                } else {
+                    assert_eq!(wire[6], 44, "IPv6 fragment extension required");
+                    let offset = u16::from_be_bytes([wire[42], wire[43]]) & 0xfff8;
+                    assert_eq!(usize::from(offset), datagram.len());
+                    header_size + 8
+                };
+                datagram.extend_from_slice(&wire[offset..]);
+            }
+            assert_eq!(u16::from_be_bytes([datagram[4], datagram[5]]) as usize, payload.len() + 8);
+            assert_eq!(&datagram[8..], &payload);
+            // Empty UDP is data, not stream EOF, in both directions.
+            let mut input = [0; 1];
+            assert_eq!(stream.recv(&mut input).await.unwrap(), Some(0));
+            stream.send(&[]).unwrap();
+            let empty = packets.try_recv().unwrap().to_bytes().unwrap();
+            assert_eq!(empty.len(), header_size + 8);
+            assert_eq!(&empty[header_size + 4..header_size + 6], &8u16.to_be_bytes());
+            assert!(stream.send(&vec![0; 65536]).is_err());
+            assert!(packets.try_recv().is_err());
+        }
+    }
 
     fn stream(first_payload: Vec<u8>) -> IpStackUdpStream {
         let (up_tx, _up_rx) = mpsc::unbounded_channel();
