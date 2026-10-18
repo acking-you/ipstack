@@ -462,15 +462,12 @@ impl Drop for IpStackTcpStream {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
-            if !task_handle.is_finished() {
-                if let Some(notifier) = self.exit_notifier.take() {
-                    _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
-                }
-                // synchronously wait for the task to finish
-                _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task_handle));
-            } else {
-                log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
-            }
+            // Bulk cancellation must not consume a blocking thread per stream
+            // while waiting for packet workers on the same executor. Once that
+            // pool fills, neither the workers nor shutdown timeouts can run.
+            // Aborting drops the worker's removal sender and wakes the session
+            // table watcher even if the worker has not been polled yet.
+            task_handle.abort();
         }
         let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
         log::debug!("{nt} {state:?}: [drop] session dropped, total TCP sessions: {sessions}");
@@ -1089,6 +1086,61 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    #[test]
+    fn dropping_tcp_does_not_need_an_available_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let dropper = runtime.spawn(async move {
+            let (packets, _responses) = tokio::sync::mpsc::unbounded_channel();
+            let (removed, removal) = tokio::sync::oneshot::channel();
+            let stream = IpStackTcpStream::new(
+                "192.0.2.1:5000".parse().unwrap(),
+                "198.51.100.1:443".parse().unwrap(),
+                TcpHeader {
+                    syn: true,
+                    ..Default::default()
+                },
+                packets,
+                1500,
+                Some(removed),
+                Arc::new(TcpConfig::default()),
+            )
+            .unwrap();
+            // The packet worker is queued on this same executor. A destructor
+            // must not wait for it, even when the blocking pool is saturated.
+            drop(stream);
+            finished.send(()).unwrap();
+            // Both explicit removal and cancellation must release the table
+            // entry; neither may leave its removal watcher waiting forever.
+            let _ = removal.await;
+        });
+        let completed_without_extra_worker = completion.recv_timeout(Duration::from_millis(500)).is_ok();
+        // Release the gate before asserting so the old implementation fails
+        // without leaving this test or its runtime permanently deadlocked.
+        release.send(()).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), dropper).await.unwrap().unwrap();
+            blocker.await.unwrap();
+        });
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        assert!(
+            completed_without_extra_worker,
+            "TCP Drop blocked the executor waiting for its own packet worker"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_notifies_an_idle_peer_and_releases_the_session() {
         let src: SocketAddr = "192.0.2.1:5000".parse().unwrap();
@@ -1135,7 +1187,8 @@ mod tests {
         stream.abort().unwrap();
         assert!(responses.try_recv().is_err(), "abort is idempotent");
         drop(stream);
-        tokio::time::timeout(Duration::from_secs(1), removal).await.unwrap().unwrap();
+        // The table watcher treats sender cancellation as removal as well.
+        let _ = tokio::time::timeout(Duration::from_secs(1), removal).await.unwrap();
     }
 
     #[test]
