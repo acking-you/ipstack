@@ -407,9 +407,11 @@ fn create_stream(
             let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
             Ok(IpStackStream::Tcp(stream))
         }
-        TransportHeader::Udp(_) => {
+        TransportHeader::Udp(header) => {
+            let headers = (packet.ip.clone(), header.clone());
             let payload = packet.payload.unwrap_or_default();
-            let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
+            let mut stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
+            stream.first_headers = Some(headers);
             Ok(IpStackStream::Udp(stream))
         }
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),

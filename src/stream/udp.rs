@@ -46,6 +46,7 @@ pub struct IpStackUdpStream {
     stream_receiver: PacketReceiver,
     up_pkt_sender: PacketSender,
     first_payload: Option<Vec<u8>>,
+    pub(crate) first_headers: Option<(IpHeader, UdpHeader)>,
     timeout: Pin<Box<Sleep>>,
     timeout_interval: Duration,
     mtu: u16,
@@ -71,6 +72,7 @@ impl IpStackUdpStream {
             stream_receiver,
             up_pkt_sender,
             first_payload: Some(payload),
+            first_headers: None,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
@@ -83,33 +85,37 @@ impl IpStackUdpStream {
     }
 
     fn create_rev_packet(&self, ttl: u8, payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
+        Self::create_packet(self.dst_addr, self.src_addr, ttl, payload)
+    }
+
+    fn create_packet(src_addr: SocketAddr, dst_addr: SocketAddr, ttl: u8, payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
-        match (self.dst_addr.ip(), self.src_addr.ip()) {
-            (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets()).map_err(IpStackError::from)?;
+        match (src_addr.ip(), dst_addr.ip()) {
+            (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) => {
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, source.octets(), destination.octets()).map_err(IpStackError::from)?;
                 ip_h.set_payload_len(payload.len() + UHS).map_err(IpStackError::from)?;
-                let udp_header = UdpHeader::with_ipv4_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
-                    .map_err(IpStackError::from)?;
+                let udp_header =
+                    UdpHeader::with_ipv4_checksum(src_addr.port(), dst_addr.port(), &ip_h, &payload).map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload: Some(payload),
                 })
             }
-            (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
+            (std::net::IpAddr::V6(source), std::net::IpAddr::V6(destination)) => {
                 let mut ip_h = Ipv6Header {
                     traffic_class: 0,
                     flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
                     next_header: IpNumber::UDP,
                     hop_limit: ttl,
-                    source: dst.octets(),
-                    destination: src.octets(),
+                    source: source.octets(),
+                    destination: destination.octets(),
                 };
                 ip_h.payload_length =
                     u16::try_from(payload.len() + UHS).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-                let udp_header = UdpHeader::with_ipv6_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
-                    .map_err(IpStackError::from)?;
+                let udp_header =
+                    UdpHeader::with_ipv6_checksum(src_addr.port(), dst_addr.port(), &ip_h, &payload).map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
@@ -223,6 +229,57 @@ impl IpStackUdpStream {
         Ok(())
     }
 
+    /// Reject a newly accepted UDP flow with ICMP port unreachable, then close
+    /// it. The quoted request identifies the application socket, including when
+    /// its destination is a virtual DNS address. Call before receiving data.
+    pub fn reject(mut self) -> std::io::Result<()> {
+        use etherparse::{Icmpv4Type, Icmpv6Type, PacketBuilder, icmpv4, icmpv6};
+        let source = self.src_addr.ip();
+        let destination = self.dst_addr.ip();
+        // ICMP errors must not amplify multicast/broadcast or invalid sources.
+        let invalid =
+            |ip: std::net::IpAddr| ip.is_unspecified() || ip.is_multicast() || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
+        if invalid(source) || invalid(destination) {
+            return Ok(());
+        }
+        let payload = self
+            .first_payload
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "UDP rejection requires an unread request"))?;
+        let original = match self.first_headers.take() {
+            Some((ip, udp)) => NetworkPacket {
+                ip,
+                transport: TransportHeader::Udp(udp),
+                payload: Some(payload),
+            },
+            None => Self::create_packet(self.src_addr, self.dst_addr, TTL, payload)?,
+        };
+        let mut quote = original.to_bytes().map_err(std::io::Error::from)?;
+        let mut bytes = Vec::new();
+        match (destination, source) {
+            (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
+                // RFC 1812: keep the complete ICMP error within 576 bytes.
+                quote.truncate(usize::from(self.mtu.min(576)).saturating_sub(28));
+                PacketBuilder::ipv4(dst.octets(), src.octets(), TTL)
+                    .icmpv4(Icmpv4Type::DestinationUnreachable(icmpv4::DestUnreachableHeader::Port))
+                    .write(&mut bytes, &quote)
+                    .map_err(std::io::Error::other)?;
+            }
+            (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
+                // RFC 4443: include as much of the request as fits in 1280.
+                quote.truncate(usize::from(self.mtu.min(1280)).saturating_sub(48));
+                PacketBuilder::ipv6(dst.octets(), src.octets(), TTL)
+                    .icmpv6(Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::Port))
+                    .write(&mut bytes, &quote)
+                    .map_err(std::io::Error::other)?;
+            }
+            _ => return Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+        self.up_pkt_sender
+            .send(NetworkPacket::parse(&bytes).map_err(std::io::Error::from)?)
+            .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+    }
+
     fn reset_timeout(&mut self) {
         let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
@@ -236,6 +293,7 @@ impl IpStackUdpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<Option<()>>> {
         if let Some(p) = self.first_payload.take() {
+            self.first_headers = None;
             // Clamp to `buf.remaining()`: an oversized datagram would otherwise
             // panic `put_slice` (hit under `copy_bidirectional` write
             // backpressure). Unlike the TCP path the remainder is DROPPED, not buffered matches `recvfrom` without MSG_WAITALL.
@@ -301,6 +359,43 @@ impl Drop for IpStackUdpStream {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn udp_rejection_suppresses_multicast_and_requires_an_unread_request() {
+        for destination in ["224.0.0.251:5353", "[ff02::fb]:5353"] {
+            let destination: SocketAddr = destination.parse().unwrap();
+            let source = if destination.is_ipv4() {
+                "10.0.0.2:40000"
+            } else {
+                "[fd77::2]:40000"
+            };
+            let (sender, mut packets) = mpsc::unbounded_channel();
+            let stream = IpStackUdpStream::new(
+                source.parse().unwrap(),
+                destination,
+                vec![1],
+                sender,
+                1500,
+                Duration::from_secs(30),
+                None,
+            );
+            stream.reject().unwrap();
+            assert!(packets.try_recv().is_err(), "multicast must not generate ICMP errors");
+        }
+        let (sender, mut packets) = mpsc::unbounded_channel();
+        let mut stream = IpStackUdpStream::new(
+            "10.0.0.2:40000".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap(),
+            vec![1],
+            sender,
+            1500,
+            Duration::from_secs(30),
+            None,
+        );
+        stream.recv(&mut [0; 1]).await.unwrap();
+        assert_eq!(stream.reject().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(packets.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn udp_write_preserves_a_datagram_larger_than_mtu() {
