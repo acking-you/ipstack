@@ -1158,8 +1158,9 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    // Silly-window-syndrome avoidance: advertise a real window only when a full segment fits,
-    // otherwise advertise zero so the peer enters persist mode until the reader frees space.
+    // Silly-window-syndrome avoidance: advertise a real window only when the free space reaches
+    // the threshold, otherwise advertise zero so the peer enters persist mode until the reader
+    // frees space.
     let recv_window = tcb.get_recv_window();
     // RFC 7323 §2.2: the window field of a segment carrying SYN is not scaled.
     let advertised = if flags & SYN != 0 {
@@ -1167,7 +1168,11 @@ pub(crate) fn write_packet_to_device(
     } else {
         tcb.get_scaled_recv_window()
     };
-    let window_size = if recv_window >= tcb.get_mtu() { advertised } else { 0 };
+    let window_size = if tcb.get_available_read_buffer_size() >= tcb.get_recv_window_threshold() {
+        advertised
+    } else {
+        0
+    };
     let ack = tcb.get_ack().0;
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let mut tcp_options = Vec::new();
@@ -1553,6 +1558,11 @@ mod tests {
     /// Opens a connection with a SYN advertising `window` and `syn_options`, returning the stream
     /// and the SYN-ACK the stack emitted.
     async fn open(window: u16, syn_options: &[TcpOptionElement]) -> (IpStackTcpStream, TcpHeader, PacketReceiver) {
+        open_with_mtu(1500, window, syn_options).await
+    }
+
+    /// [`open`] on a stack whose MTU is `mtu`.
+    async fn open_with_mtu(mtu: u16, window: u16, syn_options: &[TcpOptionElement]) -> (IpStackTcpStream, TcpHeader, PacketReceiver) {
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let (src, dst) = (SocketAddr::from(([10, 0, 0, 2], 40000)), SocketAddr::from(([10, 0, 0, 1], 80)));
 
@@ -1560,7 +1570,7 @@ mod tests {
         syn.syn = true;
         syn.set_options(syn_options).unwrap();
 
-        let stream = IpStackTcpStream::new(src, dst, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, syn, up_tx, mtu, None, Arc::new(TcpConfig::default())).unwrap();
         let packet = up_rx.recv().await.expect("the stack emitted no SYN-ACK");
         let TransportHeader::Tcp(syn_ack) = packet.transport_header() else {
             panic!("the emitted SYN-ACK is not a TCP packet");
@@ -1585,6 +1595,14 @@ mod tests {
             TcpOptionElement::WindowScale(shift) => Some(shift),
             _ => None,
         })
+    }
+
+    /// An MTU larger than the read buffer still opens the receive window, from the SYN-ACK on.
+    #[tokio::test]
+    async fn mtu_above_the_read_buffer_still_opens_the_receive_window() {
+        let mtu = u16::try_from(TcpConfig::default().read_buffer_size * 2).unwrap();
+        let (_stream, syn_ack, _up_rx) = open_with_mtu(mtu, 4000, &[]).await;
+        assert_ne!(syn_ack.window_size, 0, "an empty read buffer advertised a zero window");
     }
 
     /// A peer offering a shift of 7 gets this stack's shift of 0 back and has its windows honoured

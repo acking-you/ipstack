@@ -293,6 +293,12 @@ impl Tcb {
     pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
+    /// Free receive space below which a zero window is advertised, to avoid the silly-window
+    /// syndrome (RFC 1122 §4.2.3.3): one full segment, bounded by half the read buffer so that a
+    /// buffer smaller than the MTU can still open its window.
+    pub(super) fn get_recv_window_threshold(&self) -> usize {
+        usize::from(self.mtu).min(self.read_buffer_size / 2)
+    }
     pub(super) fn get_recv_window(&self) -> u16 {
         self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
     }
