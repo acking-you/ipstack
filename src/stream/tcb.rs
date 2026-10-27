@@ -1,16 +1,27 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 
 pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the received queue per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
-/// Retransmission timeout
+/// Retransmission timeout, and the floor RFC 6298 §2.4 rounds a configured one up to
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Maximum count of retransmissions before dropping the packet
-pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
+/// Ceiling on the backed-off retransmission timeout; RFC 6298 §2.5 permits one of at least 60 seconds
+const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// R2, the transmission count at which the connection closes. Seven reaches 123 seconds against
+/// RFC 9293 §3.8.3's SHLD-11 of at least 100.
+pub(super) const MAX_RETRANSMIT_COUNT: usize = 7;
+
+/// Maximum window scale shift count, which RFC 7323 §2.3 limits to 14 for a maximum window of 1 GiB
+const MAX_WINDOW_SHIFT: u8 = 14;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
@@ -41,30 +52,45 @@ pub(super) enum PacketType {
 /// - `inflight_packets` is prerepresented bytes stream from upstream application,
 ///   which have been sent to the lower device but not yet acknowledged.
 /// - `unordered_packets` is the bytes stream received from the lower device,
-///   which can be acknowledged and extracted by `consume_unordered_packets` method
-///   then can be read by upstream application via `Tcp::poll_read` method.
+///   whose in-sequence part `acknowledge_unordered_packets` acknowledges and moves to `received`.
+/// - `received` is the acknowledged bytes stream, which `take_received` hands to the upstream reader.
+/// - `send_window_shift` is the peer's window scale, applied to every window the peer advertises,
+///   and `recv_window_shift` is this stack's own, applied to every window this stack advertises.
+///   Both are settled by the SYN exchange, and `recv_window_shift` is `None` when the peer's SYN
+///   carried no window scale option, which leaves both directions unscaled.
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    send_window: u32,
+    send_window_shift: u8,
+    recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    received: VecDeque<u8>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
     max_unacked_bytes: u32,
     read_buffer_size: usize,
     max_count_for_dup_ack: usize,
+    /// Configured retransmission timeout, the value `current_rto` collapses back to.
     rto: std::time::Duration,
+    /// Retransmission timeout in force, doubled on every expiry per RFC 6298 §5.5 up to `MAX_RTO` or `rto`, whichever is larger.
+    /// RFC 6298 §2's round-trip estimator is absent, so this starts at the configured timeout and
+    /// returns to it rather than being recomputed from a measurement.
+    current_rto: std::time::Duration,
     max_retransmit_count: usize,
 }
 
 impl Tcb {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         ack: SeqNum,
+        peer_window: u16,
+        peer_window_shift: Option<u8>,
         mtu: u16,
         max_unacked_bytes: u32,
         read_buffer_size: usize,
@@ -72,25 +98,48 @@ impl Tcb {
         rto: std::time::Duration,
         max_retransmit_count: usize,
     ) -> Tcb {
+        let rto = rto.max(RTO);
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::RngExt::random::<u32>(&mut rand::rng());
+        let send_window_shift = peer_window_shift.map_or(0, |shift| {
+            if shift > MAX_WINDOW_SHIFT {
+                log::warn!("Peer window scale shift count {shift} is too large, limiting it to {MAX_WINDOW_SHIFT}");
+                MAX_WINDOW_SHIFT
+            } else {
+                shift
+            }
+        });
+        // The stack scales its own receive window by the smallest shift that expresses the whole
+        // read buffer in the 16-bit window field.
+        let recv_window_shift = peer_window_shift.map(|_| {
+            (0..=MAX_WINDOW_SHIFT)
+                .find(|&shift| read_buffer_size >> shift <= u16::MAX as usize)
+                .unwrap_or_else(|| {
+                    log::warn!("Read buffer size {read_buffer_size} is too large to scale, limiting the shift count to {MAX_WINDOW_SHIFT}");
+                    MAX_WINDOW_SHIFT
+                })
+        });
         Tcb {
             seq: seq.into(),
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            send_window: peer_window as u32,
+            send_window_shift,
+            recv_window_shift,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
+            received: VecDeque::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
             max_unacked_bytes,
             read_buffer_size,
             max_count_for_dup_ack,
             rto,
+            current_rto: rto,
             max_retransmit_count,
         }
     }
@@ -115,16 +164,34 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
         if seq < self.ack {
+            // A retransmission re-segmented across the ack: keep the bytes past it.
+            let received = self.ack.distance(seq) as usize;
+            if received >= buf.len() {
+                #[rustfmt::skip]
+                log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+                return;
+            }
+            buf.drain(..received);
+            seq = self.ack;
+        }
+        // A segment starting beyond a closed receive window is dropped for the peer's RTO to resend.
+        if seq != self.ack && self.get_available_read_buffer_size() == 0 {
             #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
             return;
         }
-        self.unordered_packets.insert(seq, buf);
+        // Bytes past the right edge of the receive window are dropped for the peer to resend.
+        let window = self.read_buffer_size.saturating_sub(self.received.len());
+        buf.truncate(window.saturating_sub(seq.distance(self.ack) as usize));
+        if !buf.is_empty() {
+            self.unordered_packets.insert(seq, buf);
+        }
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
+        self.read_buffer_size
+            .saturating_sub(self.get_unordered_packets_total_len() + self.received.len())
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
@@ -137,8 +204,19 @@ impl Tcb {
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
+                if seq > self.ack {
                     break; // sequence number is not continuous, stop extracting
+                }
+
+                if seq < self.ack {
+                    // A retransmission re-segmented across `ack` left a stale head entry; trim the
+                    // part already delivered so consumption can continue from `ack`.
+                    let payload = self.unordered_packets.remove(&seq).unwrap();
+                    let consumed = self.ack.distance(seq) as usize;
+                    if consumed < payload.len() {
+                        self.unordered_packets.insert(self.ack, payload[consumed..].to_vec());
+                    }
+                    continue;
                 }
 
                 // remove and get the first packet
@@ -166,6 +244,19 @@ impl Tcb {
         if data.is_empty() { None } else { Some(data) }
     }
 
+    /// Acknowledges the in-sequence data of the reassembly buffer, moving it to `received`.
+    pub(super) fn acknowledge_unordered_packets(&mut self) {
+        if let Some(data) = self.consume_unordered_packets(usize::MAX) {
+            self.received.extend(data);
+        }
+    }
+
+    /// Takes up to `max_bytes` of acknowledged data, in sequence order.
+    pub(super) fn take_received(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        let len = max_bytes.min(self.received.len());
+        (len > 0).then(|| self.received.drain(..len).collect())
+    }
+
     pub(super) fn increase_seq(&mut self) {
         self.seq += 1;
     }
@@ -190,14 +281,28 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    pub(super) fn update_send_window(&mut self, window: u16) {
-        self.send_window = window;
+    fn honoured_window(&self, tcp_header: &TcpHeader) -> u32 {
+        // RFC 7323 §2.3: SND.WND = SEG.WND << Snd.Wind.Shift, except on a segment carrying SYN,
+        // whose window field is never scaled.
+        let window = tcp_header.window_size as u32;
+        if tcp_header.syn { window } else { window << self.send_window_shift }
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    pub(super) fn update_send_window(&mut self, tcp_header: &TcpHeader) {
+        self.send_window = self.honoured_window(tcp_header);
+    }
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
     pub(super) fn get_recv_window(&self) -> u16 {
         self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
+    }
+    pub(super) fn get_scaled_recv_window(&self) -> u16 {
+        // RFC 7323 §2.3: SEG.WND = RCV.WND >> Rcv.Wind.Shift
+        let window = self.get_available_read_buffer_size() >> self.recv_window_shift.unwrap_or(0);
+        window.try_into().unwrap_or(u16::MAX)
+    }
+    pub(super) fn get_recv_window_shift(&self) -> Option<u8> {
+        self.recv_window_shift
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -215,7 +320,7 @@ impl Tcb {
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
-        let rcvd_window = tcp_header.window_size;
+        let rcvd_window = self.honoured_window(tcp_header);
         let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
@@ -252,7 +357,7 @@ impl Tcb {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf, self.rto));
+        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
         Ok(())
     }
@@ -267,6 +372,9 @@ impl Tcb {
             Some((&seq, _)) if ack < seq => return,
             _ => {}
         }
+        // RFC 6298 §3: a sample from a retransmitted segment is ambiguous, so only a segment sent
+        // once is the measurement §5's note collapses the backed-off timeout on.
+        let mut measured = false;
         if let Some(seq) = self
             .inflight_packets
             .iter()
@@ -279,37 +387,71 @@ impl Tcb {
                 inflight_packet.payload.drain(0..distance);
                 inflight_packet.seq = ack;
                 self.inflight_packets.insert(ack, inflight_packet);
+            } else {
+                measured |= inflight_packet.retransmit_count == 0;
             }
         }
-        self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
+        self.inflight_packets.retain(|_, p| {
+            if ack < p.seq + p.payload.len() as u32 {
+                return true; // keep the packet in the inflight_packets
+            }
+            measured |= p.retransmit_count == 0;
+            false // remove this packet
+        });
+        if measured {
+            // With no estimator, the computation RFC 6298 §5's note calls for gives the configured
+            // timeout back, collapsing whatever §5.5 backed it off to.
+            self.current_rto = self.rto;
+        }
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
         self.inflight_packets.get(&seq)
     }
 
-    #[must_use]
-    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
-        let mut retransmit_list = Vec::new();
+    /// The deadline the connection waits on: the earliest send time in the inflight queue plus the
+    /// current retransmission timeout, present while data is outstanding and the sum fits the clock.
+    pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inflight_packets
+            .values()
+            .next()
+            .and_then(|p| p.send_time.checked_add(self.current_rto))
+    }
 
-        self.inflight_packets.retain(|_, packet| {
-            if packet.retransmit_count >= self.max_retransmit_count {
-                log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
-                return false; // remove this packet
-            }
-            if packet.is_timed_out() {
+    #[must_use]
+    /// The segments whose deadline has passed, and whether one of them reached R2, the transmission
+    /// count RFC 9293 §3.8.3 closes the connection at. At R2 the list is empty.
+    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
+        let (rto, r2) = (self.current_rto, self.max_retransmit_count);
+        if self
+            .inflight_packets
+            .values()
+            .any(|p| p.is_timed_out(rto) && p.retransmit_count + 1 >= r2)
+        {
+            return (Vec::new(), true);
+        }
+
+        let mut retransmit_list = Vec::new();
+        for packet in self.inflight_packets.values_mut() {
+            if packet.is_timed_out(rto) {
                 packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
                 retransmit_list.push(packet.clone());
             }
-            true // keep the packet in the inflight_packets
-        });
-        retransmit_list
+        }
+        if !retransmit_list.is_empty() {
+            let now = tokio::time::Instant::now();
+            self.inflight_packets.values_mut().for_each(|packet| packet.send_time = now); // restart the timer, per RFC 6298 §5.6
+            self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto)); // back off the timer, per RFC 6298 §5.5
+        }
+        (retransmit_list, false)
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
         self.inflight_packets.values().map(|p| p.payload.len()).sum()
+    }
+
+    pub(crate) fn is_inflight_queue_empty(&self) -> bool {
+        self.inflight_packets.is_empty()
     }
 
     #[allow(dead_code)]
@@ -317,10 +459,15 @@ impl Tcb {
         self.inflight_packets.values().collect::<Vec<_>>()
     }
 
+    /// Bytes that can still be sent before reaching the right edge of the peer window or the cap on
+    /// unacknowledged bytes, whichever is nearer. Simplified version: min(cwnd, rwnd) - in flight.
+    pub(super) fn get_usable_send_window(&self) -> u32 {
+        let in_flight = self.seq.distance(self.get_last_received_ack());
+        self.max_unacked_bytes.min(self.get_send_window()).saturating_sub(in_flight)
+    }
+
     pub fn is_send_buffer_full(&self) -> bool {
-        // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
-        // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window() as u32)
+        self.get_usable_send_window() == 0
     }
 }
 
@@ -328,26 +475,24 @@ impl Tcb {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    pub send_time: std::time::Instant,
+    pub send_time: tokio::time::Instant,
     pub retransmit_count: usize,
-    pub retransmit_timeout: std::time::Duration, // current retransmission timeout
 }
 
 impl InflightPacket {
-    fn new(seq: SeqNum, payload: Vec<u8>, rto: Duration) -> Self {
+    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
         Self {
             seq,
             payload,
-            send_time: std::time::Instant::now(),
+            send_time: tokio::time::Instant::now(),
             retransmit_count: 0,
-            retransmit_timeout: rto,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
-    pub(crate) fn is_timed_out(&self) -> bool {
-        self.send_time.elapsed() >= self.retransmit_timeout
+    pub(crate) fn is_timed_out(&self, rto: Duration) -> bool {
+        self.send_time.elapsed() >= rto
     }
 }
 
@@ -357,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_in_flight_packet() {
-        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50], RTO);
+        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
 
         assert!(p.contains_seq_num((u32::MAX - 1).into()));
         assert!(p.contains_seq_num(u32::MAX.into()));
@@ -372,6 +517,8 @@ mod tests {
     fn test_get_unordered_packets_with_max_bytes() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -408,10 +555,90 @@ mod tests {
         assert!(data.is_none());
     }
 
+    /// A retransmission re-segmented across the ack keeps the bytes past it (RFC 9293 §3.10.7.4
+    /// trims a segment to the part that lies in the window), instead of being dropped whole.
+    #[test]
+    fn test_add_unordered_packet_keeps_the_new_part_of_a_straddling_segment() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 100]);
+        tcb.consume_unordered_packets(usize::MAX).unwrap();
+        assert_eq!(tcb.ack, SeqNum(1100));
+
+        // 1050..1150: the first 50 bytes were already received, the last 50 are new.
+        tcb.add_unordered_packet(SeqNum(1050), vec![2; 100]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), Some(vec![2; 50]));
+        assert_eq!(tcb.ack, SeqNum(1150));
+
+        // Entirely below the ack: a pure duplicate, nothing is stored.
+        tcb.add_unordered_packet(SeqNum(1000), vec![3; 100]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), None);
+    }
+
+    #[test]
+    fn test_add_unordered_packet_enforces_read_buffer() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // fill the receive buffer to its limit
+        tcb.add_unordered_packet(SeqNum(1000), vec![7; READ_BUFFER_SIZE]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+
+        // a further out-of-order segment is dropped, keeping the buffer bounded
+        tcb.add_unordered_packet(SeqNum(1000 + 2 * READ_BUFFER_SIZE as u32), vec![8; 500]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn test_consume_trims_overlapping_head_entry() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // an out-of-order segment stored ahead of ack
+        tcb.add_unordered_packet(SeqNum(1200), vec![2; 300]);
+        // the gap-filler that a retransmission re-segmented to overlap the stored one
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 400]);
+
+        // consuming pulls [1000..1400), advancing ack into the stored entry keyed at 1200
+        let data = tcb.consume_unordered_packets(10_000).unwrap();
+        assert_eq!(data.len(), 500); // 400 + the 100 bytes of the stored entry past ack
+        assert_eq!(tcb.ack, SeqNum(1500));
+        assert_eq!(tcb.unordered_packets.len(), 0);
+    }
+
     #[test]
     fn test_update_inflight_packet_queue() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -444,6 +671,8 @@ mod tests {
     fn test_update_inflight_packet_queue_cumulative_ack() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -463,10 +692,141 @@ mod tests {
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
     }
 
-    #[test]
-    fn test_retransmit_with_exponential_backoff() {
+    /// RFC 6298 §5's note: the backed-off timeout collapses once a segment sent exactly once is acknowledged
+    #[tokio::test(start_paused = true)]
+    async fn test_backoff_collapses_on_an_unretransmitted_segment() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tokio::time::advance(RTO).await;
+        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+        assert_eq!(tcb.current_rto, RTO * 2);
+
+        // the retransmitted segment cannot say which transmission the acknowledgement answers
+        tcb.update_inflight_packet_queue(tcb.get_seq());
+        assert!(tcb.is_inflight_queue_empty());
+        assert_eq!(tcb.current_rto, RTO * 2);
+
+        // a segment sent exactly once, whose acknowledgement is the measurement
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        tcb.update_inflight_packet_queue(tcb.get_seq());
+        assert!(tcb.is_inflight_queue_empty());
+        assert_eq!(tcb.current_rto, RTO);
+    }
+
+    /// RFC 6298 §2.4: a configured timeout below one second is raised to one second.
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_below_one_second_is_raised() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            Duration::from_millis(100),
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        assert_eq!(
+            tcb.get_retransmission_deadline(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1))
+        );
+    }
+
+    /// A configured timeout beyond the clock's range gives a deadline of `None`.
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_too_large_for_the_clock_has_no_deadline() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            Duration::MAX,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        assert!(tcb.get_retransmission_deadline().is_none());
+    }
+
+    /// RFC 6298 §5.6: an expiry restarts the timer for every outstanding segment, so none is
+    /// retransmitted before the backed-off timeout has run from that expiry.
+    #[tokio::test(start_paused = true)]
+    async fn test_expiry_restarts_the_timer_for_every_segment() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tokio::time::advance(Duration::from_millis(900)).await;
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+
+        // the first segment expires, doubling the timeout to two seconds
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+
+        // nothing expires until two seconds after that expiry, and then both segments do
+        tokio::time::advance(Duration::from_millis(1900)).await;
+        assert!(tcb.collect_timed_out_inflight_packets().0.is_empty());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 2);
+    }
+
+    /// RFC 6298 §5.5: an expiry doubles the timeout, bounded above by the ceiling, so a configured
+    /// timeout larger than `MAX_RTO` is never shortened.
+    #[tokio::test(start_paused = true)]
+    async fn test_backoff_never_shortens_a_large_configured_timeout() {
+        let rto = Duration::from_secs(120);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            rto,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tokio::time::advance(rto).await;
+        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+        assert!(tcb.current_rto >= rto, "the backoff shortened the timeout to {:?}", tcb.current_rto);
+    }
+
+    /// RFC 6298 §5.5: every expiry backs the connection's timer off, so the segment is retransmitted
+    /// after a longer wait each time, and it stays outstanding once R2 reports the connection closed.
+    #[tokio::test(start_paused = true)]
+    async fn test_retransmit_with_exponential_backoff() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -478,21 +838,100 @@ mod tests {
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
         // Simulate retransmission timeouts
+        let mut previous_wait = Duration::ZERO;
         for i in 0..MAX_RETRANSMIT_COUNT {
-            // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
-            println!("timeout: {timeout:?}");
-            std::thread::sleep(timeout);
+            // Wait exactly as long as the connection asks, which is longer on every round
+            let wait = tcb.get_retransmission_deadline().unwrap() - tokio::time::Instant::now();
+            println!("timeout: {wait:?}");
+            assert!(wait >= previous_wait); // doubling, until the ceiling flattens it
+            previous_wait = wait;
+            tokio::time::advance(wait).await;
 
-            let packets = tcb.collect_timed_out_inflight_packets();
-            assert_eq!(packets.len(), 1);
-            let packet = &packets[0];
-            assert_eq!(packet.retransmit_count, i + 1);
-            assert!(packet.retransmit_timeout > RTO);
+            let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+            if i + 1 < MAX_RETRANSMIT_COUNT {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0].retransmit_count, i + 1);
+                assert!(!exhausted);
+            } else {
+                assert!(packets.is_empty());
+                assert!(exhausted);
+            }
+            assert!(tcb.current_rto > RTO);
         }
 
-        let packets = tcb.collect_timed_out_inflight_packets();
-        assert!(packets.is_empty());
-        assert!(tcb.inflight_packets.is_empty());
+        // the segment stays outstanding at R2; the connection closes rather than the queue losing it
+        assert!(!tcb.is_inflight_queue_empty());
+    }
+
+    /// A peer shift of 7 is applied to every window the peer advertises after the handshake.
+    #[test]
+    fn test_peer_window_shift_is_taken_from_the_syn() {
+        let mut tcb = window_tcb(4000, Some(7), READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000); // the SYN's own window is unscaled
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000 << 7);
+    }
+
+    /// A peer that offers no window scale option has its windows honoured as they stand.
+    #[test]
+    fn test_no_window_scale_option_leaves_the_window_unshifted() {
+        let mut tcb = window_tcb(4000, None, READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000);
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000);
+        assert_eq!(tcb.get_recv_window_shift(), None);
+    }
+
+    /// RFC 7323 §2.3 limits the shift count to 14, so a larger one is used as 14.
+    #[test]
+    fn test_peer_window_shift_above_the_maximum_is_clamped() {
+        let mut tcb = window_tcb(4000, Some(15), READ_BUFFER_SIZE);
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000 << MAX_WINDOW_SHIFT);
+    }
+
+    /// A peer opening with a closed window is held to it, whatever shift the same SYN offers.
+    #[test]
+    fn test_zero_peer_window_is_honoured() {
+        assert_eq!(window_tcb(0, None, READ_BUFFER_SIZE).get_send_window(), 0);
+        assert_eq!(window_tcb(0, Some(7), READ_BUFFER_SIZE).get_send_window(), 0);
+    }
+
+    /// The announced shift is the smallest expressing the read buffer in 16 bits, the advertised
+    /// window is the free space shifted down by it, and a peer shift of 0 still enables scaling.
+    #[test]
+    fn test_advertised_window_is_derived_from_the_read_buffer() {
+        assert_eq!(window_tcb(4000, Some(0), 16 * 1024).get_recv_window_shift(), Some(0));
+        assert_eq!(window_tcb(4000, Some(0), 64 * 1024).get_recv_window_shift(), Some(1));
+
+        // 1.2 MiB needs a shift of 5, which expresses the window only in multiples of 32, so the
+        // advertised value rounds down and withholds the remainder rather than overstating the room
+        let buffer = 1_258_291;
+        let mut tcb = window_tcb(4000, Some(0), buffer);
+        assert_eq!(tcb.get_recv_window_shift(), Some(5));
+        assert_eq!(usize::from(tcb.get_scaled_recv_window()), buffer >> 5);
+        assert!(usize::from(tcb.get_scaled_recv_window()) << 5 < buffer);
+
+        // the advertised window shrinks as the buffer fills
+        tcb.add_unordered_packet(SeqNum(1000), vec![0; buffer - 1000]);
+        assert_eq!(usize::from(tcb.get_scaled_recv_window()), 1000 >> 5);
+    }
+
+    // A `Tcb` opened by a SYN advertising `peer_window` under `peer_window_shift`.
+    fn window_tcb(peer_window: u16, peer_window_shift: Option<u8>, read_buffer_size: usize) -> Tcb {
+        Tcb::new(
+            SeqNum(1000),
+            peer_window,
+            peer_window_shift,
+            1500,
+            MAX_UNACK,
+            read_buffer_size,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        )
     }
 }
