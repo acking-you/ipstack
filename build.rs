@@ -16,9 +16,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dll_path = get_wintun_bin_relative_path()?;
         let src_path = crate_dir.join(dll_path);
 
-        let dst_path = cargo_target_dir.join("examples/wintun.dll");
+        let examples_dir = cargo_target_dir.join("examples");
+        let dst_path = examples_dir.join("wintun.dll");
 
-        // Copy to the target directory
+        // Cargo creates `examples/` only when it builds an example, which a
+        // dependent crate or a `cargo check` never does.
+        std::fs::create_dir_all(&examples_dir)?;
         std::fs::copy(src_path, &dst_path)?;
 
         // Set the modified time to the current time, or the publishing process will fail.
